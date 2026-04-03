@@ -1,0 +1,43 @@
+server:
+  port: 8090
+
+spring:
+  application:
+    name: monolith-chat
+  datasource:
+    url: jdbc:mysql://localhost:3306/social_chat?useUnicode=true&characterEncoding=utf-8&serverTimezone=GMT%2B8
+    username: root
+    password: 123456
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  elasticsearch:
+    host: es-cn-8ly3tombi0005cm0x.public.elasticsearch.aliyuncs.com
+    port: 9200
+    userName: elastic
+    password: Fh3YXl7aMITbcHTVaYtL4yJtaB1Tg3
+
+dashscope:
+  api-key: sk-cc39bec9aeb442f6b158afaef6850138
+  model-name: qwen3-max
+
+logging:
+  level:
+    io.agentscope: INFO
+    io.agentscope.examples.monolithchat: INFO
+
+agentscope:
+  studio:
+    enabled: true
+    url: http://localhost:3000
+    project: chat-backend
+    run-name-prefix: stream-chat
+
+chat:
+  personalization:
+    enabled: true
+    base-system-prompt: 你是一个有温度的智能体，请先理解用户意图再回答。
+    user-tags:
+      "55134":
+        tone: 温柔
+        verbosity: 简洁
+        focus: 结论优先
+        interest: 二次元
