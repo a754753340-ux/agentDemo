@@ -15,11 +15,15 @@ import io.agentscope.examples.monolithchat.dto.ChatSendContentBlock;
 import io.agentscope.examples.monolithchat.dto.ChatSendRequest;
 import io.agentscope.examples.monolithchat.dto.ChatSendResponse;
 import io.agentscope.examples.monolithchat.dto.ImageUrlItem;
+import io.agentscope.examples.monolithchat.dto.RecommendTagItem;
 import io.agentscope.examples.monolithchat.dto.StreamBlockData;
 import io.agentscope.examples.monolithchat.dto.StreamDeltaData;
 import io.agentscope.examples.monolithchat.dto.StreamEndData;
+import io.agentscope.examples.monolithchat.dto.StreamTagListData;
 import io.agentscope.examples.monolithchat.dto.StreamStartData;
 import io.agentscope.examples.monolithchat.dto.StreamToolConfirmData;
+import io.agentscope.examples.monolithchat.dto.TagSelectRequest;
+import io.agentscope.examples.monolithchat.dto.TagSelectResponse;
 import io.agentscope.examples.monolithchat.dto.ToolConfirmRequest;
 import io.agentscope.examples.monolithchat.dto.ToolConfirmResponse;
 import io.agentscope.examples.monolithchat.entity.ChatMessage;
@@ -54,6 +58,7 @@ public class ChatStreamService {
     private static final String STATUS_DONE = "done";
     private static final String TYPE_TEXT = "text";
     private static final String TYPE_IMAGE_LIST = "image_list";
+    private static final String TYPE_TAG_LIST = "tag_list";
     private static final String TYPE_TOOL_CONFIRM = "tool_confirm";
     private static final String DEFAULT_USER_ID = "55134";
     private static final List<String> SENSITIVE_TOOLS = List.of("delete_file", "send_email");
@@ -67,18 +72,21 @@ public class ChatStreamService {
     private final ObjectMapper objectMapper;
     private final SupervisorAgent supervisorAgent;
     private final ToolConfirmationService toolConfirmationService;
+    private final RecommendTagTaskService recommendTagTaskService;
 
     public ChatStreamService(
             ChatMessageMapper chatMessageMapper,
             MessageContentMapper messageContentMapper,
             ObjectMapper objectMapper,
             SupervisorAgent supervisorAgent,
-            ToolConfirmationService toolConfirmationService) {
+            ToolConfirmationService toolConfirmationService,
+            RecommendTagTaskService recommendTagTaskService) {
         this.chatMessageMapper = chatMessageMapper;
         this.messageContentMapper = messageContentMapper;
         this.objectMapper = objectMapper;
         this.supervisorAgent = supervisorAgent;
         this.toolConfirmationService = toolConfirmationService;
+        this.recommendTagTaskService = recommendTagTaskService;
     }
 
     public ChatSendResponse send(ChatSendRequest request) {
@@ -140,9 +148,19 @@ public class ChatStreamService {
 
                     // 3) 读取触发消息的 content block，组装成模型输入
                     List<ChatSendContentBlock> inputBlocks = findUserBlocks(safeSessionId, safeUserId, triggerMessageId);
+                    RecommendTagItem selectedTag = recommendTagTaskService.consumeSelectedTag(safeSessionId, safeUserId, triggerMessageId);
+                    String userPrompt = toPromptText(inputBlocks);
+                    if (selectedTag != null) {
+                        String label = selectedTag.getLabel() == null ? selectedTag.getId() : selectedTag.getLabel();
+                        String hint = selectedTag.getPromptHint() == null ? "" : selectedTag.getPromptHint();
+                        userPrompt = userPrompt
+                                + "\n用户已选择推荐标签：" + label
+                                + "\n请基于该标签直接给出推荐结果，不要再次调用标签推荐工具。"
+                                + (hint.isBlank() ? "" : ("\n标签约束：" + hint));
+                    }
                     Msg msg = Msg.builder()
                             .role(MsgRole.USER)
-                            .content(TextBlock.builder().text(toPromptText(inputBlocks)).build())
+                            .content(TextBlock.builder().text(userPrompt).build())
                             .build();
 
                     // 4) 流式状态缓存：
@@ -294,6 +312,31 @@ public class ChatStreamService {
                                                 sink.next(SseEventUtil.build("block", blockData));
                                                 emittedImageUrls.addAll(newUrls);
                                             }
+                                            continue;
+                                        }
+                                        if (TYPE_TAG_LIST.equals(payload.getRenderType()) && payload.getTags() != null && !payload.getTags().isEmpty()) {
+                                            suppressDelta = true;
+                                            RecommendTagTaskService.TaskState state = recommendTagTaskService.createTask(
+                                                    safeSessionId,
+                                                    safeUserId,
+                                                    triggerMessageId,
+                                                    payload.getTitle(),
+                                                    payload.getTags());
+                                            StreamTagListData tagData = new StreamTagListData();
+                                            tagData.setType(TYPE_TAG_LIST);
+                                            tagData.setTaskId(state.getTaskId());
+                                            tagData.setTitle(payload.getTitle());
+                                            tagData.setMessage("请选择一个标签继续推荐");
+                                            tagData.setTags(payload.getTags());
+                                            tagData.setTriggerMessageId(triggerMessageId);
+                                            sink.next(SseEventUtil.build("block", tagData));
+                                            interruptedForConfirm.set(true);
+                                            Disposable up = disposableRef.get();
+                                            if (up != null && !up.isDisposed()) {
+                                                up.dispose();
+                                            }
+                                            finalizeStream.run();
+                                            return;
                                         }
                                     }
                                 }
@@ -367,6 +410,25 @@ public class ChatStreamService {
         response.setStatus("ok");
         response.setTriggerMessageId(pending.getTriggerMessageId());
         response.setToolName(pending.getToolName());
+        return response;
+    }
+
+    public TagSelectResponse selectTag(TagSelectRequest request) {
+        boolean ok = recommendTagTaskService.selectTag(
+                request.getTaskId(),
+                request.getSessionId(),
+                normalizeUserId(request.getUserId()),
+                request.getTagId());
+        TagSelectResponse response = new TagSelectResponse();
+        if (!ok) {
+            response.setStatus("invalid");
+            return response;
+        }
+        RecommendTagTaskService.TaskState task = recommendTagTaskService.getByTaskId(request.getTaskId());
+        response.setStatus("ok");
+        response.setTaskId(request.getTaskId());
+        response.setTagId(request.getTagId());
+        response.setTriggerMessageId(task == null ? null : task.getTriggerMessageId());
         return response;
     }
 
@@ -614,6 +676,27 @@ public class ChatStreamService {
                 payload.setImageUrls(new ArrayList<>(urls));
                 return payload;
             }
+            if (TYPE_TAG_LIST.equals(payload.getRenderType())) {
+                List<RecommendTagItem> tags = new ArrayList<>();
+                JsonNode tagsNode = dataNode.path("tags");
+                if (tagsNode.isArray()) {
+                    for (JsonNode node : tagsNode) {
+                        String id = node.path("id").asText("");
+                        String label = node.path("label").asText("");
+                        if (id.isBlank()) {
+                            continue;
+                        }
+                        RecommendTagItem item = new RecommendTagItem();
+                        item.setId(id.trim());
+                        item.setLabel(label.isBlank() ? id.trim() : label.trim());
+                        item.setPromptHint(node.path("promptHint").asText(""));
+                        tags.add(item);
+                    }
+                }
+                payload.setTitle(dataNode.path("title").asText(""));
+                payload.setTags(tags);
+                return payload;
+            }
             return payload;
         } catch (Exception ignored) {
             return null;
@@ -653,16 +736,20 @@ public class ChatStreamService {
             if (normalized.contains("\"image_list\"")) {
                 return true;
             }
+            if (normalized.contains("\"tag_list\"")) {
+                return true;
+            }
             if (normalized.contains("\"data\"") && normalized.contains("\"images\"")) {
                 return true;
             }
         }
-        if (normalized.contains("render_type") && normalized.contains("image_list")) {
+        if (normalized.contains("render_type") && (normalized.contains("image_list") || normalized.contains("tag_list"))) {
             return true;
         }
         try {
             JsonNode root = objectMapper.readTree(text);
-            return TYPE_IMAGE_LIST.equals(root.path("render_type").asText(""));
+            String rt = root.path("render_type").asText("");
+            return TYPE_IMAGE_LIST.equals(rt) || TYPE_TAG_LIST.equals(rt);
         } catch (Exception ignored) {
             return false;
         }
@@ -741,6 +828,8 @@ public class ChatStreamService {
         private String renderType;
         private String text;
         private List<String> imageUrls;
+        private String title;
+        private List<RecommendTagItem> tags;
 
         public String getRenderType() {
             return renderType;
@@ -764,6 +853,22 @@ public class ChatStreamService {
 
         public void setImageUrls(List<String> imageUrls) {
             this.imageUrls = imageUrls;
+        }
+
+        public String getTitle() {
+            return title;
+        }
+
+        public void setTitle(String title) {
+            this.title = title;
+        }
+
+        public List<RecommendTagItem> getTags() {
+            return tags;
+        }
+
+        public void setTags(List<RecommendTagItem> tags) {
+            this.tags = tags;
         }
     }
 

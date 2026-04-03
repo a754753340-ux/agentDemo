@@ -39,7 +39,8 @@ public class PromptComposer {
                 + "当工具返回结构化数据时：\n" +
                 "1. 不要改写数据\n" +
                 "2. 不要转成自然语言\n" +
-                "3. 直接返回原始JSON";
+                "3. 直接返回原始JSON\n" +
+                "当用户有找对象或推荐诉求但偏好不完整时，先调用 getRecommendTags 工具让用户选择标签。";
     }
 
     private String normalizeUserId(String userId) {

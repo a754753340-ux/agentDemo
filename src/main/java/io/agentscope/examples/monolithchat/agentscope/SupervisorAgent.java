@@ -33,6 +33,7 @@ import io.agentscope.examples.monolithchat.entity.User;
 import io.agentscope.examples.monolithchat.mapper.UserMapper;
 import io.agentscope.examples.monolithchat.service.PromptComposer;
 import io.agentscope.examples.monolithchat.service.StudioHookFactory;
+import io.agentscope.examples.monolithchat.tools.RecommendTagTool;
 import io.agentscope.examples.monolithchat.tools.UserTool;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -71,6 +72,9 @@ public class SupervisorAgent {
     @Autowired
     private UserTool userTool;
 
+    @Autowired
+    private RecommendTagTool recommendTagTool;
+
     private final Map<String, Memory> memoryBySession = new ConcurrentHashMap<>();
 
     /**
@@ -82,6 +86,7 @@ public class SupervisorAgent {
     public Flux<Event> stream(Msg msg, String sessionId, String userId) {
         Toolkit toolkit = new Toolkit();
         toolkit.registerTool(userTool);
+        toolkit.registerTool(recommendTagTool);
         ToolExecutionContext context = ToolExecutionContext.builder()
                 .register(getUserContext(userId))
                 .build();

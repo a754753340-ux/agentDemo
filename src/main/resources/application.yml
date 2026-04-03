@@ -41,3 +41,21 @@ chat:
         verbosity: 简洁
         focus: 结论优先
         interest: 二次元
+  recommend:
+    tags:
+      - id: age_20_25
+        label: 20-25岁
+        promptHint: 推荐20-25岁区间用户
+        enabled: true
+      - id: age_26_30
+        label: 26-30岁
+        promptHint: 推荐26-30岁区间用户
+        enabled: true
+      - id: nearby
+        label: 同城优先
+        promptHint: 推荐同城或距离较近用户
+        enabled: true
+      - id: extrovert
+        label: 活泼开朗
+        promptHint: 推荐风格活泼开朗的用户
+        enabled: true

@@ -2,6 +2,8 @@ package io.agentscope.examples.monolithchat.controller;
 
 import io.agentscope.examples.monolithchat.dto.ChatSendRequest;
 import io.agentscope.examples.monolithchat.dto.ChatSendResponse;
+import io.agentscope.examples.monolithchat.dto.TagSelectRequest;
+import io.agentscope.examples.monolithchat.dto.TagSelectResponse;
 import io.agentscope.examples.monolithchat.dto.ToolConfirmRequest;
 import io.agentscope.examples.monolithchat.dto.ToolConfirmResponse;
 import io.agentscope.examples.monolithchat.service.ChatStreamService;
@@ -67,5 +69,19 @@ public class ChatStreamController {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "confirmationId is required");
         }
         return chatStreamService.confirmTool(request);
+    }
+
+    @PostMapping("/tag/select")
+    public TagSelectResponse selectTag(@RequestBody TagSelectRequest request) {
+        if (request == null || request.getSessionId() == null || request.getSessionId().isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "sessionId is required");
+        }
+        if (request.getTaskId() == null || request.getTaskId().isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "taskId is required");
+        }
+        if (request.getTagId() == null || request.getTagId().isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "tagId is required");
+        }
+        return chatStreamService.selectTag(request);
     }
 }
