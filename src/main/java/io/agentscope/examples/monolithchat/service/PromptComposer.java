@@ -40,7 +40,8 @@ public class PromptComposer {
                 "1. 不要改写数据\n" +
                 "2. 不要转成自然语言\n" +
                 "3. 直接返回原始JSON\n" +
-                "当用户有找对象或推荐诉求但偏好不完整时，先调用 getRecommendTags 工具让用户选择标签。";
+                "当用户有找对象或推荐诉求但偏好不完整时，先调用 getRecommendTags 工具让用户选择标签。\n" +
+                "【重要】当你调用了 getRecommendTags 工具并获得返回结果后，绝对不要再生成任何自然语言或文本分析，必须立刻结束本回合的回答！";
     }
 
     private String normalizeUserId(String userId) {

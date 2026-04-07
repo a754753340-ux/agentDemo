@@ -14,6 +14,15 @@ spring:
     port: 9200
     userName: elastic
     password: Fh3YXl7aMITbcHTVaYtL4yJtaB1Tg3
+  redis:
+    host: 121.199.31.219
+    port: 6380
+    jedis:
+      pool:
+        max-active: 8
+        max-wait: 1
+        max-idle: 8
+        min-idle: 0
 
 dashscope:
   api-key: sk-cc39bec9aeb442f6b158afaef6850138

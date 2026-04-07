@@ -330,13 +330,10 @@ public class ChatStreamService {
                                             tagData.setTags(payload.getTags());
                                             tagData.setTriggerMessageId(triggerMessageId);
                                             sink.next(SseEventUtil.build("block", tagData));
-                                            interruptedForConfirm.set(true);
-                                            Disposable up = disposableRef.get();
-                                            if (up != null && !up.isDisposed()) {
-                                                up.dispose();
-                                            }
-                                            finalizeStream.run();
-                                            return;
+                                            
+                                            // 无状态方案：允许大模型自然结束当前回合
+                                            // 我们不再强制中断 (dispose) 线程，而是通过 Prompt 约束 LLM 拿到 tag_list 后立刻停止发言
+                                            continue;
                                         }
                                     }
                                 }
