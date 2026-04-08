@@ -53,6 +53,15 @@ public class UserTool {
         return buildPackageListEnvelope(res);
     }
 
+    @Tool(description = "打电话")
+    public Object call(UserContext context) {
+        User user = userMapper.selectById(context.getUserId());
+//        PackageListRes res = new PackageListRes();
+       // 发送静默消息
+        return null;
+    }
+
+
     private UserCard toUserCard(User user) {
         UserCard card = new UserCard();
         card.setUserId(user.getId() == null ? null : String.valueOf(user.getId()));
@@ -60,6 +69,7 @@ public class UserTool {
         card.setAvatar(user.getAvatar());
         card.setGender(user.getGender());
         card.setDiamond(user.getDiamond());
+        card.setIntroduction(user.getIntroduction());
         return card;
     }
 
@@ -80,8 +90,9 @@ public class UserTool {
             }
             Map<String, Object> image = new LinkedHashMap<>();
             image.put("url", card.getAvatar());
-            image.put("alt", card.getNickname());
+            image.put("nickName", card.getNickname());
             image.put("userId", card.getUserId());
+            image.put("introduction", card.getIntroduction());
             images.add(image);
         }
         Map<String, Object> data = new LinkedHashMap<>();

@@ -20,6 +20,7 @@ public class User {
     private String avatar;
     private Integer gender; // 0-未知 1-男 2-女
     private Integer diamond;
+    private String introduction;
     private LocalDateTime createTime;
     private LocalDateTime updateTime;
 }

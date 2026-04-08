@@ -21,7 +21,11 @@ import io.agentscope.core.agent.Event;
 import io.agentscope.core.formatter.dashscope.DashScopeChatFormatter;
 import io.agentscope.core.memory.InMemoryMemory;
 import io.agentscope.core.memory.Memory;
+import io.agentscope.core.message.ContentBlock;
 import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.model.DashScopeChatModel;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.studio.StudioManager;
@@ -42,6 +46,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import java.util.Map;
+import java.util.List;
+import java.util.ArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -91,11 +97,36 @@ public class SupervisorAgent {
                 .register(getUserContext(userId))
                 .build();
         String sysPrompt = promptComposer.compose(userId);
+        String userPrompt = extractPromptText(msg);
+        logger.info("LLM request prompt | sessionId={} userId={} systemPrompt={}", sessionId, userId, sysPrompt);
+        logger.info("LLM request prompt | sessionId={} userId={} userPrompt={}", sessionId, userId, userPrompt);
         String key = sessionKey(sessionId, userId);
         Memory memory = memoryBySession.computeIfAbsent(key, k -> new InMemoryMemory());
         ReActAgent agent = createAgent(toolkit, memory, sysPrompt, sessionId, userId, context);
         AtomicBoolean retried = new AtomicBoolean(false);
         return agent.stream(msg)
+                .doOnNext(event -> {
+                    if (event == null) {
+                        return;
+                    }
+                    Msg out = event.getMessage();
+                    String text = clip(extractPromptText(out), 4000);
+                    List<String> toolUses = extractToolUses(out);
+                    List<String> toolResults = extractToolResultTexts(out);
+                    logger.info(
+                            "LLM response event | sessionId={} userId={} type={} last={} text={}",
+                            sessionId,
+                            userId,
+                            event.getType(),
+                            event.isLast(),
+                            text);
+                    if (!toolUses.isEmpty()) {
+                        logger.info("LLM response tools | sessionId={} userId={} tools={}", sessionId, userId, toolUses);
+                    }
+                    if (!toolResults.isEmpty()) {
+                        logger.info("LLM response toolResults | sessionId={} userId={} outputs={}", sessionId, userId, toolResults);
+                    }
+                })
                 .onErrorResume(error -> {
                     if (!isPendingToolCallError(error) || !retried.compareAndSet(false, true)) {
                         return Flux.error(error);
@@ -109,6 +140,75 @@ public class SupervisorAgent {
                     return recovered.stream(msg);
                 })
                 .doFinally(signalType -> logger.info("Stream terminated with signal: {}, session: {}", signalType, sessionId));
+    }
+
+    private String extractPromptText(Msg msg) {
+        if (msg == null || msg.getContent() == null || msg.getContent().isEmpty()) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (ContentBlock block : msg.getContent()) {
+            if (block instanceof TextBlock) {
+                String text = ((TextBlock) block).getText();
+                if (text != null) {
+                    builder.append(text);
+                }
+            }
+        }
+        return builder.toString();
+    }
+
+    private List<String> extractToolUses(Msg msg) {
+        if (msg == null || !msg.hasContentBlocks(ToolUseBlock.class)) {
+            return List.of();
+        }
+        List<String> names = new ArrayList<>();
+        for (ToolUseBlock block : msg.getContentBlocks(ToolUseBlock.class)) {
+            if (block == null || block.getName() == null || block.getName().isBlank()) {
+                continue;
+            }
+            names.add(block.getName());
+        }
+        return names;
+    }
+
+    private List<String> extractToolResultTexts(Msg msg) {
+        if (msg == null || !msg.hasContentBlocks(ToolResultBlock.class)) {
+            return List.of();
+        }
+        List<String> outputs = new ArrayList<>();
+        for (ToolResultBlock result : msg.getContentBlocks(ToolResultBlock.class)) {
+            if (result == null || result.getOutput() == null) {
+                continue;
+            }
+            StringBuilder builder = new StringBuilder();
+            for (ContentBlock block : result.getOutput()) {
+                if (block instanceof TextBlock) {
+                    String text = ((TextBlock) block).getText();
+                    if (text != null && !text.isBlank()) {
+                        if (builder.length() > 0) {
+                            builder.append('\n');
+                        }
+                        builder.append(text);
+                    }
+                }
+            }
+            if (builder.length() > 0) {
+                outputs.add(clip(builder.toString(), 4000));
+            }
+        }
+        return outputs;
+    }
+
+    private String clip(String value, int maxLen) {
+        if (value == null) {
+            return "";
+        }
+        String trimmed = value.strip();
+        if (trimmed.length() <= maxLen) {
+            return trimmed;
+        }
+        return trimmed.substring(0, Math.max(0, maxLen));
     }
 
     private boolean isPendingToolCallError(Throwable error) {

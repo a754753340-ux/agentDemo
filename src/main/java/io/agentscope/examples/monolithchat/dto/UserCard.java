@@ -9,4 +9,6 @@ public class UserCard {
     private String avatar;
     private Integer gender;
     private Integer diamond;
+
+    private String introduction;
 }

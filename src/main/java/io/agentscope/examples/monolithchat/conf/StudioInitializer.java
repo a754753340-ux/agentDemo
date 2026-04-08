@@ -29,12 +29,16 @@ public class StudioInitializer implements ApplicationRunner {
                 : properties.getRunNamePrefix();
         String runName = runNamePrefix + "_" + System.currentTimeMillis();
 
-        StudioManager.init()
-                .studioUrl(properties.getUrl())
-                .project(properties.getProject())
-                .runName(runName)
-                .initialize()
-                .block();
-        logger.info("AgentScope Studio initialized: url={}, project={}", properties.getUrl(), properties.getProject());
+        try {
+            StudioManager.init()
+                    .studioUrl(properties.getUrl())
+                    .project(properties.getProject())
+                    .runName(runName)
+                    .initialize()
+                    .block();
+            logger.info("AgentScope Studio initialized: url={}, project={}", properties.getUrl(), properties.getProject());
+        } catch (Exception e) {
+            logger.error("Error initializing AgentScope Studio", e);
+        }
     }
 }

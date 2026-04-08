@@ -45,11 +45,11 @@ agentscope:
 chat:
   personalization:
     enabled: true
-    base-system-prompt: 你是一个有温度的智能体，请先理解用户意图再回答。
+    base-system-prompt: 你是一个智能助手，请先理解用户意图再回答。
     user-tags:
       "55134":
-        tone: 温柔
-        verbosity: 简洁
+#        tone: 温柔
+#        verbosity: 简洁
 #        focus: 结论优先
         interest: 二次元
   recommend:

@@ -34,6 +34,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
 import reactor.core.scheduler.Schedulers;
 import reactor.core.Disposable;
 
@@ -62,8 +63,17 @@ public class ChatStreamService {
     private static final String TYPE_IMAGE_LIST = "image_list";
     private static final String TYPE_TAG_LIST = "tag_list";
     private static final String TYPE_TOOL_CONFIRM = "tool_confirm";
+    private static final String TYPE_PACKAGE_LIST = "package_list";
+    private static final String TYPE_DM_CARD = "dm_card";
+    private static final String TYPE_RECOMMEND_LIST = "recommend_list";
     private static final String DEFAULT_USER_ID = "55134";
+    private static final String DEFAULT_TOOL_CONFIRM_MESSAGE = "是否允许执行该工具？";
+    private static final String DEFAULT_TAG_SELECT_MESSAGE = "请选择你喜欢的用户标签，我们将为你推荐";
     private static final List<String> SENSITIVE_TOOLS = List.of("delete_file", "send_email");
+    private static final Map<String, String> TEXT_DATA_BLOCK_TYPE_MAPPING = Map.of(
+            "packageList", TYPE_PACKAGE_LIST,
+            "dmCard", TYPE_DM_CARD
+    );
     private static final Pattern MARKDOWN_IMAGE_PATTERN =
             Pattern.compile("!\\[[^\\]]*\\]\\((?<url>[^)\\s]+)\\)");
     private static final Pattern IMAGE_URL_PATTERN =
@@ -100,6 +110,9 @@ public class ChatStreamService {
         this.semanticMemoryEsService = semanticMemoryEsService;
     }
 
+    /**
+     * 持久化用户输入消息并返回 trigger messageId。
+     */
     public ChatSendResponse send(ChatSendRequest request) {
         String sessionId = normalizeSessionId(request.getSessionId());
         String userId = normalizeUserId(request.getUserId());
@@ -127,6 +140,9 @@ public class ChatStreamService {
         return response;
     }
 
+    /**
+     * 对外提供流式对话输出，统一编排：上下文装配、Agent 调用、工具结果分发、落库与收尾。
+     */
     public Flux<ServerSentEvent<Object>> stream(String sessionId, String userId, String triggerMessageId) {
         return Flux.<ServerSentEvent<Object>>create(sink -> {
                     // 1) 归一化请求参数并创建 assistant 占位消息（streaming）
@@ -293,7 +309,7 @@ public class ChatStreamService {
                                         confirmData.setToolName(toolName);
                                         confirmData.setToolInput(tool.getInput());
                                         confirmData.setTriggerMessageId(triggerMessageId);
-                                        confirmData.setMessage("是否允许执行该工具？");
+                                        confirmData.setMessage(DEFAULT_TOOL_CONFIRM_MESSAGE);
                                         sink.next(SseEventUtil.build("block", confirmData));
                                         interruptedForConfirm.set(true);
                                         Disposable up = disposableRef.get();
@@ -314,47 +330,19 @@ public class ChatStreamService {
                                         if (payload == null || payload.getRenderType() == null) {
                                             continue;
                                         }
-                                        suppressDelta = true;
-                                        if (TYPE_TEXT.equals(payload.getRenderType()) && payload.getText() != null && !payload.getText().isBlank()) {
-                                            String toolText = payload.getText();
-                                            fullTextRef[0] = fullTextRef[0] + toolText;
-                                            StreamDeltaData deltaData = new StreamDeltaData();
-                                            deltaData.setType(TYPE_TEXT);
-                                            deltaData.setDelta(toolText);
-                                            sink.next(SseEventUtil.build("delta", deltaData));
-                                            continue;
-                                        }
-                                        if (TYPE_IMAGE_LIST.equals(payload.getRenderType()) && payload.getImageUrls() != null && !payload.getImageUrls().isEmpty()) {
-                                            suppressDelta = true;
-                                            imageUrls.addAll(payload.getImageUrls());
-                                            LinkedHashSet<String> newUrls = new LinkedHashSet<>(payload.getImageUrls());
-                                            newUrls.removeAll(emittedImageUrls);
-                                            if (!newUrls.isEmpty()) {
-                                                StreamBlockData blockData = new StreamBlockData();
-                                                blockData.setType(TYPE_IMAGE_LIST);
-                                                blockData.setImages(toImageItems(newUrls));
-                                                sink.next(SseEventUtil.build("block", blockData));
-                                                emittedImageUrls.addAll(newUrls);
-                                            }
-                                            continue;
-                                        }
-                                        if (TYPE_TAG_LIST.equals(payload.getRenderType()) && payload.getTags() != null && !payload.getTags().isEmpty()) {
-                                            suppressDelta = true;
-                                            RecommendTagTaskService.TaskState state = recommendTagTaskService.createTask(
-                                                    safeSessionId,
-                                                    safeUserId,
-                                                    triggerMessageId,
-                                                    payload.getTitle(),
-                                                    payload.getTags());
-                                            StreamTagListData tagData = new StreamTagListData();
-                                            tagData.setType(TYPE_TAG_LIST);
-                                            tagData.setTaskId(state.getTaskId());
-                                            tagData.setTitle(payload.getTitle());
-                                            tagData.setMessage("请选择一个标签继续推荐");
-                                            tagData.setTags(payload.getTags());
-                                            tagData.setTriggerMessageId(triggerMessageId);
-                                            sink.next(SseEventUtil.build("block", tagData));
-                                            continue;
+                                        PayloadHandleResult resultState = handleToolPayload(
+                                                payload,
+                                                sink,
+                                                fullTextRef,
+                                                interruptedForConfirm,
+                                                disposableRef,
+                                                finalizeStream,
+                                                safeSessionId,
+                                                safeUserId,
+                                                triggerMessageId);
+                                        suppressDelta = suppressDelta || resultState.isSuppressDelta();
+                                        if (resultState.isFinalized()) {
+                                            return;
                                         }
                                     }
                                 }
@@ -406,6 +394,9 @@ public class ChatStreamService {
                 .subscribeOn(Schedulers.boundedElastic());
     }
 
+    /**
+     * 工具确认回调：记录用户是否批准敏感工具执行，并返回可继续对话的 triggerMessageId。
+     */
     public ToolConfirmResponse confirmTool(ToolConfirmRequest request) {
         ToolConfirmationService.PendingTool pending = toolConfirmationService.getPending(request.getConfirmationId());
         if (pending == null) {
@@ -431,6 +422,9 @@ public class ChatStreamService {
         return response;
     }
 
+    /**
+     * 标签选择回调：保存用户选择结果并返回下一轮触发消息标识。
+     */
     public TagSelectResponse selectTag(TagSelectRequest request) {
         String safeUserId = normalizeUserId(request.getUserId());
         String safeSessionId = normalizeSessionId(request.getSessionId());
@@ -692,6 +686,131 @@ public class ChatStreamService {
         return new ArrayList<>(urls);
     }
 
+    /**
+     * 处理工具 envelope 输出并转换为前端可消费的事件。
+     * 返回值用于控制主循环是否抑制 delta、是否立刻结束当前流。
+     */
+    private PayloadHandleResult handleToolPayload(
+            ToolRenderPayload payload,
+            FluxSink<ServerSentEvent<Object>> sink,
+            String[] fullTextRef,
+            AtomicBoolean interruptedForConfirm,
+            AtomicReference<Disposable> disposableRef,
+            Runnable finalizeStream,
+            String sessionId,
+            String userId,
+            String triggerMessageId) {
+        if (TYPE_TEXT.equals(payload.getRenderType()) && payload.getText() != null && !payload.getText().isBlank()) {
+            emitTextDelta(payload.getText(), sink, fullTextRef);
+            emitMappedTextDataBlocks(payload.getDataMap(), sink);
+            return PayloadHandleResult.suppressOnly();
+        }
+        if (TYPE_IMAGE_LIST.equals(payload.getRenderType()) && payload.getImageUrls() != null && !payload.getImageUrls().isEmpty()) {
+//            imageUrls.addAll(payload.getImageUrls());
+//            emitImageListBlock(payload.getImageUrls(), sink);
+            emitRecommendListBlock(payload.getDataMap(), sink);
+            interruptedForConfirm.set(true);
+            Disposable up = disposableRef.get();
+            if (up != null && !up.isDisposed()) {
+                up.dispose();
+            }
+            finalizeStream.run();
+            return PayloadHandleResult.suppressAndFinalize();
+        }
+        if (TYPE_TAG_LIST.equals(payload.getRenderType()) && payload.getTags() != null && !payload.getTags().isEmpty()) {
+            RecommendTagTaskService.TaskState state = recommendTagTaskService.createTask(
+                    sessionId,
+                    userId,
+                    triggerMessageId,
+                    payload.getTitle(),
+                    payload.getTags());
+            StreamTagListData tagData = new StreamTagListData();
+            tagData.setType(TYPE_TAG_LIST);
+            tagData.setTaskId(state.getTaskId());
+            tagData.setTitle(payload.getTitle());
+            tagData.setMessage(DEFAULT_TAG_SELECT_MESSAGE);
+            tagData.setTags(payload.getTags());
+            tagData.setTriggerMessageId(triggerMessageId);
+            sink.next(SseEventUtil.build("block", tagData));
+            interruptedForConfirm.set(true);
+            Disposable up = disposableRef.get();
+            if (up != null && !up.isDisposed()) {
+                up.dispose();
+            }
+            finalizeStream.run();
+            return PayloadHandleResult.suppressAndFinalize();
+        }
+        return PayloadHandleResult.none();
+    }
+
+    /**
+     * 下发 text 增量并同步更新可落库的完整文本缓存。
+     */
+    private void emitTextDelta(String text, FluxSink<ServerSentEvent<Object>> sink, String[] fullTextRef) {
+        StreamDeltaData deltaData = new StreamDeltaData();
+        deltaData.setType(TYPE_TEXT);
+        deltaData.setDelta(text);
+        sink.next(SseEventUtil.build("delta", deltaData));
+        fullTextRef[0] = fullTextRef[0] + text;
+    }
+
+    /**
+     * 将 text 类型中附带的结构化数据，按 key->blockType 映射下发为 block 事件。
+     */
+    private void emitMappedTextDataBlocks(Map<String, Object> dataMap, FluxSink<ServerSentEvent<Object>> sink) {
+        if (dataMap == null || dataMap.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<String, String> mapping : TEXT_DATA_BLOCK_TYPE_MAPPING.entrySet()) {
+            Object value = dataMap.get(mapping.getKey());
+            if (value == null) {
+                continue;
+            }
+            StreamBlockData block = new StreamBlockData();
+            block.setType(mapping.getValue());
+            if (TYPE_PACKAGE_LIST.equals(mapping.getValue())) {
+                Map<String, Object> data = new LinkedHashMap<>();
+                data.put("packageList", value);
+                block.setData(data);
+            } else {
+                block.setData(value);
+            }
+            sink.next(SseEventUtil.build("block", block));
+        }
+    }
+
+    /**
+     * 下发图片列表 block，并通过 emittedImageUrls 去重，避免重复推送。
+     */
+    private void emitImageListBlock(List<String> payloadImageUrls, FluxSink<ServerSentEvent<Object>> sink) {
+        StreamBlockData blockData = new StreamBlockData();
+        blockData.setType(TYPE_IMAGE_LIST);
+//        blockData.setImages(payloadImageUrls);
+        sink.next(SseEventUtil.build("block", blockData));
+//        emittedImageUrls.addAll(newUrls);
+    }
+
+    /**
+     * 当图片数据具备推荐卡片结构时，额外下发 recommend_list block。
+     */
+    private void emitRecommendListBlock(Map<String, Object> dataMap, FluxSink<ServerSentEvent<Object>> sink) {
+        if (dataMap == null) {
+            return;
+        }
+        Object images = dataMap.get("images");
+        if (!(images instanceof List) || !hasRecommendShape((List<?>) images)) {
+            return;
+        }
+        StreamBlockData recommendBlock = new StreamBlockData();
+        recommendBlock.setType(TYPE_RECOMMEND_LIST);
+        recommendBlock.setMessage("选择你心仪的女生");
+        recommendBlock.setData(images);
+        sink.next(SseEventUtil.build("block", recommendBlock));
+    }
+
+    /**
+     * 从 ToolResultBlock 中提取第一个可识别的工具渲染 payload。
+     */
     private ToolRenderPayload extractToolRenderPayload(ToolResultBlock result) {
         if (result == null || result.getOutput() == null || result.getOutput().isEmpty()) {
             return null;
@@ -712,9 +831,15 @@ public class ChatStreamService {
         return null;
     }
 
+    /**
+     * 解析工具原始输出字符串，兼容 text/image_list/tag_list 三类 envelope。
+     */
     private ToolRenderPayload parseToolRenderPayloadFromRaw(String raw) {
         try {
-            JsonNode root = objectMapper.readTree(raw);
+            JsonNode root = parseJsonLoose(raw);
+            if (root == null) {
+                return null;
+            }
             String renderType = root.path("render_type").asText("");
             if (renderType.isBlank()) {
                 return null;
@@ -722,13 +847,19 @@ public class ChatStreamService {
             ToolRenderPayload payload = new ToolRenderPayload();
             payload.setRenderType(renderType.trim());
             JsonNode dataNode = root.path("data");
+            JsonNode normalizedDataNode = unwrapDataNode(dataNode);
+            if (dataNode.isObject()) {
+                payload.setDataMap(objectMapper.convertValue(dataNode, Map.class));
+            } else if (normalizedDataNode != null && normalizedDataNode.isObject()) {
+                payload.setDataMap(objectMapper.convertValue(normalizedDataNode, Map.class));
+            }
             if (TYPE_TEXT.equals(payload.getRenderType())) {
-                if (dataNode.isTextual()) {
-                    payload.setText(dataNode.asText(""));
+                if (normalizedDataNode != null && normalizedDataNode.isTextual()) {
+                    payload.setText(normalizedDataNode.asText(""));
                     return payload;
                 }
-                if (dataNode.isObject()) {
-                    payload.setText(dataNode.path("text").asText(""));
+                if (normalizedDataNode != null && normalizedDataNode.isObject()) {
+                    payload.setText(normalizedDataNode.path("text").asText(""));
                     return payload;
                 }
                 payload.setText(root.path("text").asText(""));
@@ -736,12 +867,12 @@ public class ChatStreamService {
             }
             if (TYPE_IMAGE_LIST.equals(payload.getRenderType())) {
                 LinkedHashSet<String> urls = new LinkedHashSet<>();
-                if (dataNode.isArray()) {
-                    for (JsonNode node : dataNode) {
+                if (normalizedDataNode != null && normalizedDataNode.isArray()) {
+                    for (JsonNode node : normalizedDataNode) {
                         collectImageUrl(node, urls);
                     }
-                } else if (dataNode.isObject() && dataNode.path("images").isArray()) {
-                    for (JsonNode node : dataNode.path("images")) {
+                } else if (normalizedDataNode != null && normalizedDataNode.isObject() && normalizedDataNode.path("images").isArray()) {
+                    for (JsonNode node : normalizedDataNode.path("images")) {
                         collectImageUrl(node, urls);
                     }
                 } else if (root.path("images").isArray()) {
@@ -754,7 +885,10 @@ public class ChatStreamService {
             }
             if (TYPE_TAG_LIST.equals(payload.getRenderType())) {
                 List<RecommendTagItem> tags = new ArrayList<>();
-                JsonNode tagsNode = dataNode.path("tags");
+                JsonNode tagsNode = normalizedDataNode == null ? null : normalizedDataNode.path("tags");
+                if (tagsNode == null || !tagsNode.isArray()) {
+                    tagsNode = root.path("tags");
+                }
                 if (tagsNode.isArray()) {
                     for (JsonNode node : tagsNode) {
                         String id = node.path("id").asText("");
@@ -769,7 +903,11 @@ public class ChatStreamService {
                         tags.add(item);
                     }
                 }
-                payload.setTitle(dataNode.path("title").asText(""));
+                String title = normalizedDataNode == null ? "" : normalizedDataNode.path("title").asText("");
+                if (title == null || title.isBlank()) {
+                    title = root.path("title").asText("");
+                }
+                payload.setTitle(title);
                 payload.setTags(tags);
                 return payload;
             }
@@ -777,6 +915,60 @@ public class ChatStreamService {
         } catch (Exception ignored) {
             return null;
         }
+    }
+
+    private JsonNode unwrapDataNode(JsonNode dataNode) {
+        if (dataNode == null || dataNode.isMissingNode() || dataNode.isNull()) {
+            return dataNode;
+        }
+        if (!dataNode.isTextual()) {
+            return dataNode;
+        }
+        String text = dataNode.asText("");
+        if (text.isBlank()) {
+            return dataNode;
+        }
+        JsonNode parsed = parseJsonLoose(text);
+        return parsed == null ? dataNode : parsed;
+    }
+
+    /**
+     * 宽松 JSON 解析：支持 markdown code fence 和文本中嵌入 JSON 子串。
+     */
+    private JsonNode parseJsonLoose(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        String text = raw.strip();
+        if (text.startsWith("```")) {
+            text = text.replace("```json", "").replace("```JSON", "").replace("```", "").strip();
+        }
+        try {
+            return objectMapper.readTree(text);
+        } catch (Exception ignored) {
+        }
+        int start = text.indexOf('{');
+        int end = text.lastIndexOf('}');
+        if (start >= 0 && end > start) {
+            String candidate = text.substring(start, end + 1);
+            try {
+                return objectMapper.readTree(candidate);
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    private boolean hasRecommendShape(List<?> images) {
+        if (images == null || images.isEmpty()) {
+            return false;
+        }
+        Object first = images.get(0);
+        if (!(first instanceof Map)) {
+            return false;
+        }
+        Map<?, ?> map = (Map<?, ?>) first;
+        return map.containsKey("userId") || map.containsKey("nickname") || map.containsKey("avatar");
     }
 
     private void collectImageUrl(JsonNode node, Set<String> urls) {
@@ -906,6 +1098,7 @@ public class ChatStreamService {
         private List<String> imageUrls;
         private String title;
         private List<RecommendTagItem> tags;
+        private Map<String, Object> dataMap;
 
         public String getRenderType() {
             return renderType;
@@ -945,6 +1138,44 @@ public class ChatStreamService {
 
         public void setTags(List<RecommendTagItem> tags) {
             this.tags = tags;
+        }
+
+        public Map<String, Object> getDataMap() {
+            return dataMap;
+        }
+
+        public void setDataMap(Map<String, Object> dataMap) {
+            this.dataMap = dataMap;
+        }
+    }
+
+    private static class PayloadHandleResult {
+        private final boolean suppressDelta;
+        private final boolean finalized;
+
+        private PayloadHandleResult(boolean suppressDelta, boolean finalized) {
+            this.suppressDelta = suppressDelta;
+            this.finalized = finalized;
+        }
+
+        public static PayloadHandleResult none() {
+            return new PayloadHandleResult(false, false);
+        }
+
+        public static PayloadHandleResult suppressOnly() {
+            return new PayloadHandleResult(true, false);
+        }
+
+        public static PayloadHandleResult suppressAndFinalize() {
+            return new PayloadHandleResult(true, true);
+        }
+
+        public boolean isSuppressDelta() {
+            return suppressDelta;
+        }
+
+        public boolean isFinalized() {
+            return finalized;
         }
     }
 
