@@ -23,6 +23,8 @@ spring:
         max-wait: 1
         max-idle: 8
         min-idle: 0
+    timeout: 5000
+    password: iMs6bqS23A
 
 dashscope:
   api-key: sk-cc39bec9aeb442f6b158afaef6850138
@@ -48,7 +50,7 @@ chat:
       "55134":
         tone: 温柔
         verbosity: 简洁
-        focus: 结论优先
+#        focus: 结论优先
         interest: 二次元
   recommend:
     tags:

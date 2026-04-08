@@ -39,8 +39,10 @@ import reactor.core.Disposable;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -73,6 +75,9 @@ public class ChatStreamService {
     private final SupervisorAgent supervisorAgent;
     private final ToolConfirmationService toolConfirmationService;
     private final RecommendTagTaskService recommendTagTaskService;
+    private final RedisShortTermMemoryService redisShortTermMemoryService;
+    private final UserLongTermMemoryService userLongTermMemoryService;
+    private final SemanticMemoryEsService semanticMemoryEsService;
 
     public ChatStreamService(
             ChatMessageMapper chatMessageMapper,
@@ -80,29 +85,41 @@ public class ChatStreamService {
             ObjectMapper objectMapper,
             SupervisorAgent supervisorAgent,
             ToolConfirmationService toolConfirmationService,
-            RecommendTagTaskService recommendTagTaskService) {
+            RecommendTagTaskService recommendTagTaskService,
+            RedisShortTermMemoryService redisShortTermMemoryService,
+            UserLongTermMemoryService userLongTermMemoryService,
+            SemanticMemoryEsService semanticMemoryEsService) {
         this.chatMessageMapper = chatMessageMapper;
         this.messageContentMapper = messageContentMapper;
         this.objectMapper = objectMapper;
         this.supervisorAgent = supervisorAgent;
         this.toolConfirmationService = toolConfirmationService;
         this.recommendTagTaskService = recommendTagTaskService;
+        this.redisShortTermMemoryService = redisShortTermMemoryService;
+        this.userLongTermMemoryService = userLongTermMemoryService;
+        this.semanticMemoryEsService = semanticMemoryEsService;
     }
 
     public ChatSendResponse send(ChatSendRequest request) {
         String sessionId = normalizeSessionId(request.getSessionId());
+        String userId = normalizeUserId(request.getUserId());
         String messageId = UUID.randomUUID().toString();
         int seq = nextSeq(sessionId);
         ChatMessage message = new ChatMessage();
         message.setMessageId(messageId);
         message.setSessionId(sessionId);
-        message.setUserId(request.getUserId());
+        message.setUserId(userId);
         message.setRole(ROLE_USER);
         message.setStatus(STATUS_DONE);
         message.setSeq(seq);
         message.setCreateTime(LocalDateTime.now());
         chatMessageMapper.insert(message);
-        persistContentBlocks(messageId, normalizeBlocks(request.getContent()));
+        List<ChatSendContentBlock> normalized = normalizeBlocks(request.getContent());
+        persistContentBlocks(messageId, normalized);
+        String userText = toPromptText(normalized);
+        redisShortTermMemoryService.appendUserMessage(sessionId, userId, messageId, userText);
+        userLongTermMemoryService.recordBehavior(userId, sessionId, "user_input", clip(userText, 400), messageId);
+        semanticMemoryEsService.save(userId, sessionId, "user_input", clip(userText, 600), 0.4, messageId);
         ChatSendResponse response = new ChatSendResponse();
         response.setMessageId(messageId);
         response.setSessionId(sessionId);
@@ -157,7 +174,11 @@ public class ChatStreamService {
                                 + "\n用户已选择推荐标签：" + label
                                 + "\n请基于该标签直接给出推荐结果，不要再次调用标签推荐工具。"
                                 + (hint.isBlank() ? "" : ("\n标签约束：" + hint));
+                        userLongTermMemoryService.recordTagSelection(safeUserId, "tag_select", selectedTag);
+                        userLongTermMemoryService.recordBehavior(safeUserId, safeSessionId, "tag_select", label, triggerMessageId);
+                        semanticMemoryEsService.save(safeUserId, safeSessionId, "tag_preference", "用户选择推荐标签：" + label, 0.9, triggerMessageId);
                     }
+                    userPrompt = composeMemoryAwarePrompt(safeSessionId, safeUserId, userPrompt);
                     Msg msg = Msg.builder()
                             .role(MsgRole.USER)
                             .content(TextBlock.builder().text(userPrompt).build())
@@ -204,6 +225,9 @@ public class ChatStreamService {
                         }
                         try {
                             persistAssistantContent(messageId, fullTextRef[0], images);
+                            redisShortTermMemoryService.appendAssistantMessage(safeSessionId, safeUserId, messageId, fullTextRef[0]);
+                            userLongTermMemoryService.recordBehavior(safeUserId, safeSessionId, "assistant_reply", clip(fullTextRef[0], 500), triggerMessageId);
+                            semanticMemoryEsService.save(safeUserId, safeSessionId, "assistant_reply", clip(fullTextRef[0], 800), 0.6, triggerMessageId);
                         } catch (Throwable ignored) {
                         }
                         try {
@@ -330,9 +354,6 @@ public class ChatStreamService {
                                             tagData.setTags(payload.getTags());
                                             tagData.setTriggerMessageId(triggerMessageId);
                                             sink.next(SseEventUtil.build("block", tagData));
-                                            
-                                            // 无状态方案：允许大模型自然结束当前回合
-                                            // 我们不再强制中断 (dispose) 线程，而是通过 Prompt 约束 LLM 拿到 tag_list 后立刻停止发言
                                             continue;
                                         }
                                     }
@@ -411,10 +432,12 @@ public class ChatStreamService {
     }
 
     public TagSelectResponse selectTag(TagSelectRequest request) {
+        String safeUserId = normalizeUserId(request.getUserId());
+        String safeSessionId = normalizeSessionId(request.getSessionId());
         boolean ok = recommendTagTaskService.selectTag(
                 request.getTaskId(),
-                request.getSessionId(),
-                normalizeUserId(request.getUserId()),
+                safeSessionId,
+                safeUserId,
                 request.getTagId());
         TagSelectResponse response = new TagSelectResponse();
         if (!ok) {
@@ -426,6 +449,18 @@ public class ChatStreamService {
         response.setTaskId(request.getTaskId());
         response.setTagId(request.getTagId());
         response.setTriggerMessageId(task == null ? null : task.getTriggerMessageId());
+        if (task != null && task.getTags() != null) {
+            RecommendTagItem selected = task.getTags().stream()
+                    .filter(item -> item != null && request.getTagId() != null && request.getTagId().equals(item.getId()))
+                    .findFirst()
+                    .orElse(null);
+            if (selected != null) {
+                String label = selected.getLabel() == null || selected.getLabel().isBlank() ? selected.getId() : selected.getLabel();
+                userLongTermMemoryService.recordTagSelection(safeUserId, "tag_select_api", selected);
+                userLongTermMemoryService.recordBehavior(safeUserId, safeSessionId, "tag_select", label, task.getTriggerMessageId());
+                semanticMemoryEsService.save(safeUserId, safeSessionId, "tag_preference", "用户选择推荐标签：" + label, 0.9, task.getTriggerMessageId());
+            }
+        }
         return response;
     }
 
@@ -573,6 +608,50 @@ public class ChatStreamService {
             }
         }
         return builder.toString();
+    }
+
+    private String composeMemoryAwarePrompt(String sessionId, String userId, String currentInput) {
+        List<String> shortTerm = redisShortTermMemoryService.loadRecentTextContext(sessionId, userId, 12);
+        String longTermTags = userLongTermMemoryService.loadTagSummary(userId, 10);
+        String longTermBehavior = userLongTermMemoryService.loadBehaviorSummary(userId, 10);
+        List<String> semanticMemories = semanticMemoryEsService.search(userId, currentInput, 5);
+        StringBuilder builder = new StringBuilder();
+        if (!shortTerm.isEmpty()) {
+            builder.append("【短期记忆】\n");
+            for (String item : shortTerm) {
+                builder.append("- ").append(item).append('\n');
+            }
+        }
+        if (longTermTags != null && !longTermTags.isBlank()) {
+            builder.append("【长期标签记忆】\n");
+            builder.append(longTermTags).append('\n');
+        }
+        if (longTermBehavior != null && !longTermBehavior.isBlank()) {
+            builder.append("【长期行为记忆】\n");
+            builder.append(longTermBehavior).append('\n');
+        }
+        if (semanticMemories != null && !semanticMemories.isEmpty()) {
+            builder.append("【长期语义记忆】\n");
+            for (String memory : semanticMemories) {
+                if (memory == null || memory.isBlank()) {
+                    continue;
+                }
+                builder.append("- ").append(memory.strip()).append('\n');
+            }
+        }
+        builder.append("【用户当前输入】\n").append(currentInput == null ? "" : currentInput);
+        return builder.toString();
+    }
+
+    private String clip(String text, int maxLen) {
+        if (text == null) {
+            return "";
+        }
+        String value = text.strip();
+        if (value.length() <= maxLen) {
+            return value;
+        }
+        return value.substring(0, Math.max(0, maxLen));
     }
 
     private String extractText(Msg msg) {
