@@ -4,8 +4,8 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import io.agentscope.core.tool.Tool;
 import io.agentscope.examples.monolithchat.dto.PackageListRes;
 import io.agentscope.examples.monolithchat.dto.ProductRes;
-import io.agentscope.examples.monolithchat.dto.UserContext;
 import io.agentscope.examples.monolithchat.dto.UserCard;
+import io.agentscope.examples.monolithchat.dto.UserContext;
 import io.agentscope.examples.monolithchat.entity.User;
 import io.agentscope.examples.monolithchat.mapper.UserMapper;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -33,11 +33,16 @@ public class UserTool {
     }
 
     @Tool(description = "推荐异性用户")
-    public Object getRecommend(UserContext context) {
-        // 目前用随机算法选择异性信息
+    public Object getRecommend(UserContext context,Integer num,String tag) {
+        int limitNum = num == null ? 5 : num;
+        if (limitNum < 1) {
+            limitNum = 1;
+        } else if (limitNum > 5) {
+            limitNum = 5;
+        }
         LambdaQueryWrapper<User> queryWrapper = new LambdaQueryWrapper<>();
         queryWrapper.ne(User::getId, context.getUserId()).ne(User::getGender, context.getSex())
-                .last("ORDER BY RAND() LIMIT 5");      // 随机5条
+                .last("ORDER BY RAND() LIMIT " + num);
         List<User> users = userMapper.selectList(queryWrapper);
         List<UserCard> cards = users.stream().map(this::toUserCard).collect(Collectors.toList());
         return buildImageListEnvelope(cards);
@@ -54,11 +59,16 @@ public class UserTool {
     }
 
     @Tool(description = "打电话")
-    public Object call(UserContext context) {
-        User user = userMapper.selectById(context.getUserId());
-//        PackageListRes res = new PackageListRes();
-       // 发送静默消息
-        return null;
+    public Object call(UserContext context, String targetUserId) {
+        String receiverId = targetUserId == null ? "" : targetUserId.strip();
+        if (receiverId.isBlank()) {
+            return buildTextEnvelope("请先提供要拨打电话的用户ID。");
+        }
+        User target = userMapper.selectById(receiverId);
+        String nickname = target == null || target.getNickname() == null || target.getNickname().isBlank()
+                ? receiverId
+                : target.getNickname().strip();
+        return buildCallEnvelope(receiverId, nickname);
     }
 
 
@@ -142,6 +152,23 @@ public class UserTool {
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("text", buildPackageListText(packageListRes));
         data.put("packageList", packageListRes);
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("render_type", "text");
+        payload.put("data", data);
+        return payload;
+    }
+
+    private Map<String, Object> buildCallEnvelope(String receiverId, String nickname) {
+        Map<String, Object> callCard = new LinkedHashMap<>();
+        callCard.put("title", "语音通话");
+        callCard.put("content", "准备呼叫：" + nickname);
+        callCard.put("actionText", "拨打电话");
+        callCard.put("receiverId", receiverId);
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("text", "已为你准备好通话。");
+        data.put("callCard", callCard);
+
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("render_type", "text");
         payload.put("data", data);

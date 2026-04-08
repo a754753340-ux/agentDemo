@@ -65,6 +65,7 @@ public class ChatStreamService {
     private static final String TYPE_TOOL_CONFIRM = "tool_confirm";
     private static final String TYPE_PACKAGE_LIST = "package_list";
     private static final String TYPE_DM_CARD = "dm_card";
+    private static final String TYPE_CALL_CARD = "call_card";
     private static final String TYPE_RECOMMEND_LIST = "recommend_list";
     private static final String DEFAULT_USER_ID = "55134";
     private static final String DEFAULT_TOOL_CONFIRM_MESSAGE = "是否允许执行该工具？";
@@ -72,12 +73,15 @@ public class ChatStreamService {
     private static final List<String> SENSITIVE_TOOLS = List.of("delete_file", "send_email");
     private static final Map<String, String> TEXT_DATA_BLOCK_TYPE_MAPPING = Map.of(
             "packageList", TYPE_PACKAGE_LIST,
-            "dmCard", TYPE_DM_CARD
+            "dmCard", TYPE_DM_CARD,
+            "callCard", TYPE_CALL_CARD
     );
     private static final Pattern MARKDOWN_IMAGE_PATTERN =
             Pattern.compile("!\\[[^\\]]*\\]\\((?<url>[^)\\s]+)\\)");
     private static final Pattern IMAGE_URL_PATTERN =
             Pattern.compile("(?i)\\bhttps?://[^\\s)\\]}>]+\\.(png|jpe?g|gif|webp)(\\?[^\\s)\\]}>]+)?");
+    private static final Pattern RECOMMEND_NUM_PATTERN =
+            Pattern.compile("(?:推荐|来|给我|给我来|请推荐)\\s*(\\d{1,2})\\s*(?:个|位|名)?");
 
     private final ChatMessageMapper chatMessageMapper;
     private final MessageContentMapper messageContentMapper;
@@ -183,6 +187,7 @@ public class ChatStreamService {
                     List<ChatSendContentBlock> inputBlocks = findUserBlocks(safeSessionId, safeUserId, triggerMessageId);
                     RecommendTagItem selectedTag = recommendTagTaskService.consumeSelectedTag(safeSessionId, safeUserId, triggerMessageId);
                     String userPrompt = toPromptText(inputBlocks);
+                    Integer requestedRecommendNum = extractRequestedRecommendNum(userPrompt);
                     if (selectedTag != null) {
                         String label = selectedTag.getLabel() == null ? selectedTag.getId() : selectedTag.getLabel();
                         String hint = selectedTag.getPromptHint() == null ? "" : selectedTag.getPromptHint();
@@ -193,6 +198,11 @@ public class ChatStreamService {
                         userLongTermMemoryService.recordTagSelection(safeUserId, "tag_select", selectedTag);
                         userLongTermMemoryService.recordBehavior(safeUserId, safeSessionId, "tag_select", label, triggerMessageId);
                         semanticMemoryEsService.save(safeUserId, safeSessionId, "tag_preference", "用户选择推荐标签：" + label, 0.9, triggerMessageId);
+                    }
+                    if (requestedRecommendNum != null) {
+                        userPrompt = userPrompt
+                                + "\n用户本轮明确要求推荐人数：" + requestedRecommendNum
+                                + "\n调用 getRecommend 工具时请设置 num=" + requestedRecommendNum + "。";
                     }
                     userPrompt = composeMemoryAwarePrompt(safeSessionId, safeUserId, userPrompt);
                     Msg msg = Msg.builder()
@@ -635,6 +645,28 @@ public class ChatStreamService {
         }
         builder.append("【用户当前输入】\n").append(currentInput == null ? "" : currentInput);
         return builder.toString();
+    }
+
+    private Integer extractRequestedRecommendNum(String text) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        Matcher matcher = RECOMMEND_NUM_PATTERN.matcher(text);
+        if (!matcher.find()) {
+            return null;
+        }
+        try {
+            int num = Integer.parseInt(matcher.group(1));
+            if (num < 1) {
+                return 1;
+            }
+            if (num > 20) {
+                return 20;
+            }
+            return num;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private String clip(String text, int maxLen) {
