@@ -42,6 +42,7 @@ public class ChatStreamService {
     private static final String TYPE_DM_CARD = "dm_card";
     private static final String TYPE_CALL_CARD = "call_card";
     private static final String TYPE_RECOMMEND_LIST = "recommend_list";
+    private static final String TYPE_ACTION_SUGGEST = "action_suggest";
     private static final String DEFAULT_USER_ID = "55134";
     private static final String DEFAULT_TOOL_CONFIRM_MESSAGE = "是否允许执行该工具？";
     private static final String DEFAULT_TAG_SELECT_MESSAGE = "请选择你喜欢的用户标签，我们将为你推荐";
@@ -56,6 +57,11 @@ public class ChatStreamService {
             Pattern.compile("(?i)\\bhttps?://[^\\s)\\]}>]+\\.(png|jpe?g|gif|webp)(\\?[^\\s)\\]}>]+)?");
     private static final Pattern RECOMMEND_NUM_PATTERN =
             Pattern.compile("(?:推荐|来|给我|给我来|请推荐)\\s*(\\d{1,2})\\s*(?:个|位|名)?");
+    private static final Pattern PARTNER_BIND_PATTERN =
+            Pattern.compile("我(?:的)?(女朋友|男朋友|老婆|老公)是\\s*(\\d{1,10})");
+    private static final Map<String, Pattern> ACTION_TOOL_INTENT_PATTERNS = Map.of(
+            "call", Pattern.compile("(打电话|拨打|通话|联系|call)")
+    );
 
     private final ChatMessageMapper chatMessageMapper;
     private final MessageContentMapper messageContentMapper;
@@ -160,8 +166,26 @@ public class ChatStreamService {
                     // 3) 读取触发消息的 content block，组装成模型输入
                     List<ChatSendContentBlock> inputBlocks = findUserBlocks(safeSessionId, safeUserId, triggerMessageId);
                     RecommendTagItem selectedTag = recommendTagTaskService.consumeSelectedTag(safeSessionId, safeUserId, triggerMessageId);
-                    String userPrompt = toPromptText(inputBlocks);
+                    String rawUserInput = toPromptText(inputBlocks);
+                    PartnerBinding partnerBinding = extractPartnerBinding(rawUserInput);
+                    String userPrompt = rawUserInput;
                     Integer requestedRecommendNum = extractRequestedRecommendNum(userPrompt);
+                    if (partnerBinding != null) {
+                        userLongTermMemoryService.recordBehavior(
+                                safeUserId,
+                                safeSessionId,
+                                "partner_binding",
+                                partnerBinding.getRelation() + "=" + partnerBinding.getTargetUserId(),
+                                triggerMessageId);
+                        semanticMemoryEsService.save(
+                                safeUserId,
+                                safeSessionId,
+                                "partner_binding",
+                                "用户" + partnerBinding.getRelation() + "是" + partnerBinding.getTargetUserId(),
+                                0.9,
+                                triggerMessageId);
+                        userPrompt = userPrompt + "\n这是关系信息更新，不是动作指令；请先确认是否需要打电话或发私信，不要直接执行 call 工具。";
+                    }
                     if (selectedTag != null) {
                         String label = selectedTag.getLabel() == null ? selectedTag.getId() : selectedTag.getLabel();
                         String hint = selectedTag.getPromptHint() == null ? "" : selectedTag.getPromptHint();
@@ -270,6 +294,23 @@ public class ChatStreamService {
                                             continue;
                                         }
                                         String toolName = tool.getName();
+                                        if (isActionTool(toolName) && !hasExplicitActionIntent(rawUserInput, toolName)) {
+                                            String text = partnerBinding == null
+                                                    ? "我已记录你的信息。如需执行该操作，请明确告诉我。"
+                                                    : "已记住你的" + partnerBinding.getRelation() + "是" + partnerBinding.getTargetUserId()
+                                                    + "。要不要现在给TA打电话或发私信？";
+                                            emitTextDelta(text, sink, fullTextRef);
+                                            if (partnerBinding != null) {
+                                                emitActionSuggestBlock(sink, partnerBinding.getTargetUserId(), "是否现在联系TA？");
+                                            }
+                                            interruptedForConfirm.set(true);
+                                            Disposable up = disposableRef.get();
+                                            if (up != null && !up.isDisposed()) {
+                                                up.dispose();
+                                            }
+                                            finalizeStream.run();
+                                            return;
+                                        }
                                         if (!SENSITIVE_TOOLS.contains(toolName)) {
                                             continue;
                                         }
@@ -641,6 +682,46 @@ public class ChatStreamService {
         } catch (Exception ignored) {
             return null;
         }
+    }
+
+    private boolean isActionTool(String toolName) {
+        return toolName != null && ACTION_TOOL_INTENT_PATTERNS.containsKey(toolName);
+    }
+
+    private boolean hasExplicitActionIntent(String text, String toolName) {
+        if (text == null || text.isBlank() || toolName == null) {
+            return false;
+        }
+        Pattern pattern = ACTION_TOOL_INTENT_PATTERNS.get(toolName);
+        if (pattern == null) {
+            return false;
+        }
+        return pattern.matcher(text).find();
+    }
+
+    private PartnerBinding extractPartnerBinding(String text) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        Matcher matcher = PARTNER_BIND_PATTERN.matcher(text);
+        if (!matcher.find()) {
+            return null;
+        }
+        return new PartnerBinding(matcher.group(1), matcher.group(2));
+    }
+
+    private void emitActionSuggestBlock(FluxSink<ServerSentEvent<Object>> sink, String targetUserId, String message) {
+        StreamBlockData block = new StreamBlockData();
+        block.setType(TYPE_ACTION_SUGGEST);
+        block.setMessage(message);
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("targetUserId", targetUserId);
+        List<Map<String, Object>> actions = new ArrayList<>();
+        actions.add(Map.of("action", "call", "label", "打电话"));
+        actions.add(Map.of("action", "dm", "label", "发私信"));
+        data.put("actions", actions);
+        block.setData(data);
+        sink.next(SseEventUtil.build("block", block));
     }
 
     private String clip(String text, int maxLen) {
@@ -1198,6 +1279,24 @@ public class ChatStreamService {
         private int jsonDepth;
         private boolean inString;
         private boolean escaped;
+    }
+
+    private static class PartnerBinding {
+        private final String relation;
+        private final String targetUserId;
+
+        private PartnerBinding(String relation, String targetUserId) {
+            this.relation = relation;
+            this.targetUserId = targetUserId;
+        }
+
+        public String getRelation() {
+            return relation;
+        }
+
+        public String getTargetUserId() {
+            return targetUserId;
+        }
     }
 
     private List<ImageUrlItem> toImageItems(Set<String> urls) {
