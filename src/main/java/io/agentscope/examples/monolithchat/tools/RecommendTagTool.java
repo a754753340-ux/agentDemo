@@ -19,7 +19,7 @@ public class RecommendTagTool {
         this.recommendTagProperties = recommendTagProperties;
     }
 
-    @Tool(description = "根据用户意图返回推荐标签列表供用户选择")
+    @Tool(description = "当用户意图不明确，不具体时，返回推荐标签列表供用户选择")
     public Object getRecommendTags() {
         List<RecommendTagItem> tags = new ArrayList<>();
         for (RecommendTagProperties.TagItem item : recommendTagProperties.getTags()) {
