@@ -150,10 +150,9 @@ public class UserTool {
 
     private Map<String, Object> buildPackageListEnvelope(PackageListRes packageListRes) {
         Map<String, Object> data = new LinkedHashMap<>();
-        data.put("text", buildPackageListText(packageListRes));
         data.put("packageList", packageListRes);
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("render_type", "text");
+        payload.put("render_type", "package_list");
         payload.put("data", data);
         return payload;
     }

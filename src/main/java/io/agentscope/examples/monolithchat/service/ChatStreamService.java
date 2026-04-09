@@ -4,28 +4,9 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.agentscope.core.message.ContentBlock;
-import io.agentscope.core.message.Msg;
-import io.agentscope.core.message.MsgRole;
-import io.agentscope.core.message.TextBlock;
-import io.agentscope.core.message.ToolResultBlock;
-import io.agentscope.core.message.ToolUseBlock;
+import io.agentscope.core.message.*;
 import io.agentscope.examples.monolithchat.agentscope.SupervisorAgent;
-import io.agentscope.examples.monolithchat.dto.ChatSendContentBlock;
-import io.agentscope.examples.monolithchat.dto.ChatSendRequest;
-import io.agentscope.examples.monolithchat.dto.ChatSendResponse;
-import io.agentscope.examples.monolithchat.dto.ImageUrlItem;
-import io.agentscope.examples.monolithchat.dto.RecommendTagItem;
-import io.agentscope.examples.monolithchat.dto.StreamBlockData;
-import io.agentscope.examples.monolithchat.dto.StreamDeltaData;
-import io.agentscope.examples.monolithchat.dto.StreamEndData;
-import io.agentscope.examples.monolithchat.dto.StreamTagListData;
-import io.agentscope.examples.monolithchat.dto.StreamStartData;
-import io.agentscope.examples.monolithchat.dto.StreamToolConfirmData;
-import io.agentscope.examples.monolithchat.dto.TagSelectRequest;
-import io.agentscope.examples.monolithchat.dto.TagSelectResponse;
-import io.agentscope.examples.monolithchat.dto.ToolConfirmRequest;
-import io.agentscope.examples.monolithchat.dto.ToolConfirmResponse;
+import io.agentscope.examples.monolithchat.dto.*;
 import io.agentscope.examples.monolithchat.entity.ChatMessage;
 import io.agentscope.examples.monolithchat.entity.MessageContent;
 import io.agentscope.examples.monolithchat.mapper.ChatMessageMapper;
@@ -33,19 +14,13 @@ import io.agentscope.examples.monolithchat.mapper.MessageContentMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 import reactor.core.scheduler.Schedulers;
-import reactor.core.Disposable;
 
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
@@ -72,7 +47,6 @@ public class ChatStreamService {
     private static final String DEFAULT_TAG_SELECT_MESSAGE = "请选择你喜欢的用户标签，我们将为你推荐";
     private static final List<String> SENSITIVE_TOOLS = List.of("delete_file", "send_email");
     private static final Map<String, String> TEXT_DATA_BLOCK_TYPE_MAPPING = Map.of(
-            "packageList", TYPE_PACKAGE_LIST,
             "dmCard", TYPE_DM_CARD,
             "callCard", TYPE_CALL_CARD
     );
@@ -772,6 +746,19 @@ public class ChatStreamService {
             finalizeStream.run();
             return PayloadHandleResult.suppressAndFinalize();
         }
+        if (TYPE_PACKAGE_LIST.equals(payload.getRenderType())) {
+            StreamBlockData packageBlock = new StreamBlockData();
+            packageBlock.setType(TYPE_PACKAGE_LIST);
+            packageBlock.setData(payload.getDataMap() == null ? Map.of() : payload.getDataMap());
+            sink.next(SseEventUtil.build("block", packageBlock));
+            interruptedForConfirm.set(true);
+            Disposable up = disposableRef.get();
+            if (up != null && !up.isDisposed()) {
+                up.dispose();
+            }
+            finalizeStream.run();
+            return PayloadHandleResult.suppressAndFinalize();
+        }
         return PayloadHandleResult.none();
     }
 
@@ -800,13 +787,7 @@ public class ChatStreamService {
             }
             StreamBlockData block = new StreamBlockData();
             block.setType(mapping.getValue());
-            if (TYPE_PACKAGE_LIST.equals(mapping.getValue())) {
-                Map<String, Object> data = new LinkedHashMap<>();
-                data.put("packageList", value);
-                block.setData(data);
-            } else {
-                block.setData(value);
-            }
+            block.setData(value);
             sink.next(SseEventUtil.build("block", block));
         }
     }
@@ -864,7 +845,7 @@ public class ChatStreamService {
     }
 
     /**
-     * 解析工具原始输出字符串，兼容 text/image_list/tag_list 三类 envelope。
+     * 解析工具原始输出字符串，兼容 text/image_list/tag_list/package_list 四类 envelope。
      */
     private ToolRenderPayload parseToolRenderPayloadFromRaw(String raw) {
         try {
