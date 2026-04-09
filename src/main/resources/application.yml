@@ -70,3 +70,44 @@ chat:
         label: 活泼开朗
         promptHint: 推荐风格活泼开朗的用户
         enabled: true
+  tool-policy:
+    recommend:
+      intent-patterns:
+        - 推荐
+        - 找对象
+        - 匹配
+        - 来\\d+个
+        - 给我推荐
+      preference-patterns:
+        appearance:
+          - 性感
+          - 清纯
+          - 甜美
+          - 御姐
+          - 可爱
+          - 漂亮
+          - 高颜值
+        personality:
+          - 温柔
+          - 活泼
+          - 开朗
+          - 高冷
+          - 幽默
+          - 成熟
+        interest:
+          - 健身
+          - 旅行
+          - 二次元
+          - 游戏
+          - 读书
+          - 音乐
+          - 电影
+        scene:
+          - 同城
+          - 附近
+          - 白天
+          - 夜晚
+      min-preference-signals: 1
+      fallback-recommend-count: 5
+      direct-recommend-text: 好的，我已根据你的偏好直接为你推荐：
+      reject-recommend-text: 如果你需要推荐，我可以根据你的偏好马上帮你筛选。

@@ -9,8 +9,10 @@ import io.agentscope.examples.monolithchat.agentscope.SupervisorAgent;
 import io.agentscope.examples.monolithchat.dto.*;
 import io.agentscope.examples.monolithchat.entity.ChatMessage;
 import io.agentscope.examples.monolithchat.entity.MessageContent;
+import io.agentscope.examples.monolithchat.entity.User;
 import io.agentscope.examples.monolithchat.mapper.ChatMessageMapper;
 import io.agentscope.examples.monolithchat.mapper.MessageContentMapper;
+import io.agentscope.examples.monolithchat.mapper.UserMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
@@ -72,6 +74,8 @@ public class ChatStreamService {
     private final RedisShortTermMemoryService redisShortTermMemoryService;
     private final UserLongTermMemoryService userLongTermMemoryService;
     private final SemanticMemoryEsService semanticMemoryEsService;
+    private final ToolPolicyService toolPolicyService;
+    private final UserMapper userMapper;
 
     public ChatStreamService(
             ChatMessageMapper chatMessageMapper,
@@ -82,7 +86,9 @@ public class ChatStreamService {
             RecommendTagTaskService recommendTagTaskService,
             RedisShortTermMemoryService redisShortTermMemoryService,
             UserLongTermMemoryService userLongTermMemoryService,
-            SemanticMemoryEsService semanticMemoryEsService) {
+            SemanticMemoryEsService semanticMemoryEsService,
+            ToolPolicyService toolPolicyService,
+            UserMapper userMapper) {
         this.chatMessageMapper = chatMessageMapper;
         this.messageContentMapper = messageContentMapper;
         this.objectMapper = objectMapper;
@@ -92,6 +98,8 @@ public class ChatStreamService {
         this.redisShortTermMemoryService = redisShortTermMemoryService;
         this.userLongTermMemoryService = userLongTermMemoryService;
         this.semanticMemoryEsService = semanticMemoryEsService;
+        this.toolPolicyService = toolPolicyService;
+        this.userMapper = userMapper;
     }
 
     /**
@@ -167,6 +175,7 @@ public class ChatStreamService {
                     List<ChatSendContentBlock> inputBlocks = findUserBlocks(safeSessionId, safeUserId, triggerMessageId);
                     RecommendTagItem selectedTag = recommendTagTaskService.consumeSelectedTag(safeSessionId, safeUserId, triggerMessageId);
                     String rawUserInput = toPromptText(inputBlocks);
+                    ToolPolicyService.RecommendDecision recommendDecision = toolPolicyService.analyzeRecommendIntent(rawUserInput);
                     PartnerBinding partnerBinding = extractPartnerBinding(rawUserInput);
                     String userPrompt = rawUserInput;
                     Integer requestedRecommendNum = extractRequestedRecommendNum(userPrompt);
@@ -201,6 +210,9 @@ public class ChatStreamService {
                         userPrompt = userPrompt
                                 + "\n用户本轮明确要求推荐人数：" + requestedRecommendNum
                                 + "\n调用 getRecommend 工具时请设置 num=" + requestedRecommendNum + "。";
+                    }
+                    if (recommendDecision.isSufficientPreference()) {
+                        userPrompt = userPrompt + "\n用户偏好已足够明确，禁止调用 getRecommendTags，请直接调用 getRecommend。";
                     }
                     userPrompt = composeMemoryAwarePrompt(safeSessionId, safeUserId, userPrompt);
                     Msg msg = Msg.builder()
@@ -294,6 +306,27 @@ public class ChatStreamService {
                                             continue;
                                         }
                                         String toolName = tool.getName();
+                                        if ("getRecommendTags".equals(toolName) && recommendDecision.isSufficientPreference()) {
+                                            emitTextDelta(toolPolicyService.directRecommendText(), sink, fullTextRef);
+                                            emitRecommendFallbackBlock(safeUserId, sink);
+                                            interruptedForConfirm.set(true);
+                                            Disposable up = disposableRef.get();
+                                            if (up != null && !up.isDisposed()) {
+                                                up.dispose();
+                                            }
+                                            finalizeStream.run();
+                                            return;
+                                        }
+                                        if ("getRecommend".equals(toolName) && !recommendDecision.isHasRecommendIntent() && !recommendDecision.isSufficientPreference()) {
+                                            emitTextDelta(toolPolicyService.rejectRecommendText(), sink, fullTextRef);
+                                            interruptedForConfirm.set(true);
+                                            Disposable up = disposableRef.get();
+                                            if (up != null && !up.isDisposed()) {
+                                                up.dispose();
+                                            }
+                                            finalizeStream.run();
+                                            return;
+                                        }
                                         if (isActionTool(toolName) && !hasExplicitActionIntent(rawUserInput, toolName)) {
                                             String text = partnerBinding == null
                                                     ? "我已记录你的信息。如需执行该操作，请明确告诉我。"
@@ -722,6 +755,43 @@ public class ChatStreamService {
         data.put("actions", actions);
         block.setData(data);
         sink.next(SseEventUtil.build("block", block));
+    }
+
+    private void emitRecommendFallbackBlock(String userId, FluxSink<ServerSentEvent<Object>> sink) {
+        List<Map<String, Object>> cards = loadRecommendCards(userId, toolPolicyService.fallbackRecommendCount());
+        if (cards.isEmpty()) {
+            return;
+        }
+        StreamBlockData block = new StreamBlockData();
+        block.setType(TYPE_RECOMMEND_LIST);
+        block.setMessage("根据你的偏好为你推荐");
+        block.setData(cards);
+        sink.next(SseEventUtil.build("block", block));
+    }
+
+    private List<Map<String, Object>> loadRecommendCards(String userId, int limit) {
+        User me = userMapper.selectById(userId);
+        if (me == null || me.getGender() == null) {
+            return List.of();
+        }
+        LambdaQueryWrapper<User> query = new LambdaQueryWrapper<>();
+        query.ne(User::getId, userId)
+                .ne(User::getGender, me.getGender())
+                .last("ORDER BY RAND() LIMIT " + Math.max(1, Math.min(20, limit)));
+        List<User> users = userMapper.selectList(query);
+        List<Map<String, Object>> cards = new ArrayList<>();
+        for (User user : users) {
+            if (user == null) {
+                continue;
+            }
+            Map<String, Object> card = new LinkedHashMap<>();
+            card.put("url", user.getAvatar());
+            card.put("nickName", user.getNickname());
+            card.put("userId", user.getId());
+            card.put("introduction", user.getIntroduction());
+            cards.add(card);
+        }
+        return cards;
     }
 
     private String clip(String text, int maxLen) {

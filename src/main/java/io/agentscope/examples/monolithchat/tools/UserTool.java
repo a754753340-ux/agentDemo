@@ -59,8 +59,8 @@ public class UserTool {
     }
 
     @Tool(description = "打电话")
-    public Object call(UserContext context, String targetUserId) {
-        String receiverId = targetUserId == null ? "" : targetUserId.strip();
+    public Object call(UserContext context, String targetUser) {
+        String receiverId = targetUser == null ? "" : targetUser.strip();
         if (receiverId.isBlank()) {
             return buildTextEnvelope("请先提供要拨打电话的用户ID。");
         }
