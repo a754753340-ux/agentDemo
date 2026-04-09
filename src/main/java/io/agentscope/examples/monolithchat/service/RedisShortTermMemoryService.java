@@ -80,7 +80,7 @@ public class RedisShortTermMemoryService {
     }
 
     private String contextKey(String sessionId, String userId) {
-        return "stm:ctx:" + safe(sessionId) + ":" + safe(userId);
+        return "AGENT:MEMERY:" + safe(sessionId) + ":" + safe(userId);
     }
 
     private String safe(String value) {

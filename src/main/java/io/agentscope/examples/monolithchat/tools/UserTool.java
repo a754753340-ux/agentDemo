@@ -23,14 +23,14 @@ public class UserTool {
     @Autowired
     private UserMapper userMapper;
 
-    @Tool(description = "用户信息")
-    public Object getUserInfo(
-            UserContext context
-    ) {
-        User user = userMapper.selectById(context.getUserId());
-        String text = "你的昵称是" + user.getNickname() + "，你的性别是" + user.getGender() + "你还有" + user.getDiamond() + "钻石";
-        return buildTextEnvelope(text);
-    }
+//    @Tool(description = "用户信息")
+//    public Object getUserInfo(
+//            UserContext context
+//    ) {
+//        User user = userMapper.selectById(context.getUserId());
+//        String text = "你的昵称是" + user.getNickname() + "，你的性别是" + user.getGender() + "你还有" + user.getDiamond() + "钻石";
+//        return buildTextEnvelope(text);
+//    }
 
     @Tool(description = "推荐异性用户")
     public Object getRecommend(UserContext context,Integer num,String tag) {

@@ -19,7 +19,7 @@ public class RecommendToolPolicyProperties {
     private String rejectRecommendText = "如果你需要推荐，我可以根据你的偏好马上帮你筛选。";
 
     public RecommendToolPolicyProperties() {
-        preferencePatterns.put("appearance", List.of("性感", "清纯", "甜美", "御姐", "可爱", "漂亮", "高颜值"));
+        preferencePatterns.put("appearance", List.of("性感", "清纯", "甜美", "御姐", "可爱", "漂亮", "高颜值","美女"));
         preferencePatterns.put("personality", List.of("温柔", "活泼", "开朗", "高冷", "幽默", "成熟"));
         preferencePatterns.put("interest", List.of("健身", "旅行", "二次元", "游戏", "读书", "音乐", "电影"));
         preferencePatterns.put("scene", List.of("同城", "附近", "白天", "夜晚"));
