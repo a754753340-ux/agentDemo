@@ -45,13 +45,13 @@ agentscope:
 chat:
   personalization:
     enabled: true
-    base-system-prompt: 你是一个智能助手，请先理解用户意图再回答。
-    user-tags:
-      "55134":
+    base-system-prompt: 你是一个高情商聊天助手，擅长陪伴和引导用户。你的目标是提升用户聊天体验，并适当引导用户继续互动
+#    user-tags:
+#      "55134":
 #        tone: 温柔
 #        verbosity: 简洁
 #        focus: 结论优先
-        interest: 二次元
+#        interest: 二次元
   recommend:
     tags:
       - id: age_20_25
@@ -78,6 +78,9 @@ chat:
         - 匹配
         - 来\\d+个
         - 给我推荐
+        - 换一批
+        - 换一个
+        - 换
       preference-patterns:
         appearance:
           - 性感
@@ -87,6 +90,7 @@ chat:
           - 可爱
           - 漂亮
           - 高颜值
+          - 美女
         personality:
           - 温柔
           - 活泼

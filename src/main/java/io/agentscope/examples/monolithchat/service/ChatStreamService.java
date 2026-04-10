@@ -136,6 +136,10 @@ public class ChatStreamService {
      * 对外提供流式对话输出，统一编排：上下文装配、Agent 调用、工具结果分发、落库与收尾。
      */
     public Flux<ServerSentEvent<Object>> stream(String sessionId, String userId, String triggerMessageId) {
+
+        //查询用户基础推荐信息，后续改为从redis读取
+        User user = userMapper.selectById(userId);
+
         return Flux.<ServerSentEvent<Object>>create(sink -> {
                     // 1) 归一化请求参数并创建 assistant 占位消息（streaming）
                     String safeSessionId = normalizeSessionId(sessionId);
@@ -318,13 +322,13 @@ public class ChatStreamService {
                                             return;
                                         }
                                         if ("getRecommend".equals(toolName) && !recommendDecision.isHasRecommendIntent() && !recommendDecision.isSufficientPreference()) {
-                                            emitTextDelta(toolPolicyService.rejectRecommendText(), sink, fullTextRef);
-                                            interruptedForConfirm.set(true);
-                                            Disposable up = disposableRef.get();
-                                            if (up != null && !up.isDisposed()) {
-                                                up.dispose();
-                                            }
-                                            finalizeStream.run();
+//                                            emitTextDelta(toolPolicyService.rejectRecommendText(), sink, fullTextRef);
+//                                            interruptedForConfirm.set(true);
+//                                            Disposable up = disposableRef.get();
+//                                            if (up != null && !up.isDisposed()) {
+//                                                up.dispose();
+//                                            }
+//                                            finalizeStream.run();
                                             return;
                                         }
                                         if (isActionTool(toolName) && !hasExplicitActionIntent(rawUserInput, toolName)) {
@@ -378,11 +382,38 @@ public class ChatStreamService {
                                         return;
                                     }
                                 }
-                                boolean suppressDelta = false;
+                                // 6) 先尝试输出模型自然语言（用于工具前置过渡文案）。
+                                //    这样即使同一事件中包含 ToolResult，也可先把过渡文案发给前端再展示工具卡片。
+                                String chunkText = extractText(output);
+                                if (chunkText != null && !chunkText.isBlank()) {
+                                    String lastRawText = rawTextRef[0];
+                                    String nextRawText;
+                                    String delta;
+                                    if (!lastRawText.isBlank() && chunkText.startsWith(lastRawText)) {
+                                        nextRawText = chunkText;
+                                        delta = chunkText.substring(lastRawText.length());
+                                    } else {
+                                        delta = chunkText;
+                                        nextRawText = lastRawText + delta;
+                                    }
+                                    rawTextRef[0] = nextRawText;
+                                    if (!delta.isBlank()) {
+                                        // 7) 对 delta 做 JSON 泄漏过滤，防止 {"render_type":"..."} 半截透传
+                                        String safeDelta = sanitizeDeltaForClient(delta, jsonLeakFilterState);
+                                        boolean shouldSuppress = shouldSuppressEnvelopeText(safeDelta)
+                                                || shouldSuppressEnvelopeText(nextRawText);
+                                        if (!shouldSuppress && safeDelta != null && !safeDelta.isBlank()) {
+                                            StreamDeltaData deltaData = new StreamDeltaData();
+                                            deltaData.setType(TYPE_TEXT);
+                                            deltaData.setDelta(safeDelta);
+                                            sink.next(SseEventUtil.build("delta", deltaData));
+                                            fullTextRef[0] = fullTextRef[0] + safeDelta;
+                                        }
+                                    }
+                                    imageUrls.addAll(extractImageUrls(nextRawText));
+                                }
                                 if (output != null && output.hasContentBlocks(ToolResultBlock.class)) {
-                                    // 6) 优先处理工具结果 envelope：
-                                    //    text      -> delta
-                                    //    image_list-> block
+                                    // 8) 处理工具结果 envelope
                                     for (ToolResultBlock result : output.getContentBlocks(ToolResultBlock.class)) {
                                         ToolRenderPayload payload = extractToolRenderPayload(result);
                                         if (payload == null || payload.getRenderType() == null) {
@@ -398,43 +429,13 @@ public class ChatStreamService {
                                                 safeSessionId,
                                                 safeUserId,
                                                 triggerMessageId);
-                                        suppressDelta = suppressDelta || resultState.isSuppressDelta();
                                         if (resultState.isFinalized()) {
                                             return;
                                         }
                                     }
                                 }
-                                String chunkText = extractText(output);
-                                if (chunkText != null && !chunkText.isBlank()) {
-                                    String lastRawText = rawTextRef[0];
-                                    String nextRawText;
-                                    String delta;
-                                    if (!lastRawText.isBlank() && chunkText.startsWith(lastRawText)) {
-                                        nextRawText = chunkText;
-                                        delta = chunkText.substring(lastRawText.length());
-                                    } else {
-                                        delta = chunkText;
-                                        nextRawText = lastRawText + delta;
-                                    }
-                                    rawTextRef[0] = nextRawText;
-                                    if (!delta.isBlank()) {
-                                        // 7) 对 delta 做 JSON 泄漏过滤，防止 {"render_type":"image..."} 半截透传
-                                        String safeDelta = sanitizeDeltaForClient(delta, jsonLeakFilterState);
-                                        boolean shouldSuppress = suppressDelta
-                                                || shouldSuppressEnvelopeText(safeDelta)
-                                                || shouldSuppressEnvelopeText(nextRawText);
-                                        if (!shouldSuppress && safeDelta != null && !safeDelta.isBlank()) {
-                                            StreamDeltaData deltaData = new StreamDeltaData();
-                                            deltaData.setType(TYPE_TEXT);
-                                            deltaData.setDelta(safeDelta);
-                                            sink.next(SseEventUtil.build("delta", deltaData));
-                                            fullTextRef[0] = fullTextRef[0] + safeDelta;
-                                        }
-                                    }
-                                    imageUrls.addAll(extractImageUrls(nextRawText));
-                                }
                             })
-                            // 8) 超时兜底，避免模型流无结束导致前端一直 loading
+                            // 9) 超时兜底，避免模型流无结束导致前端一直 loading
                             .doOnError(streamError::set)
                             .doFinally(signalType -> {
                                 finalizeStream.run();
@@ -663,7 +664,7 @@ public class ChatStreamService {
     }
 
     private String composeMemoryAwarePrompt(String sessionId, String userId, String currentInput) {
-        List<String> shortTerm = redisShortTermMemoryService.loadRecentTextContext(sessionId, userId, 12);
+        List<String> shortTerm = redisShortTermMemoryService.loadRecentTextContext(sessionId, userId, 3);
         String longTermTags = userLongTermMemoryService.loadTagSummary(userId, 10);
         String longTermBehavior = userLongTermMemoryService.loadBehaviorSummary(userId, 10);
         List<String> semanticMemories = semanticMemoryEsService.search(userId, currentInput, 5);
@@ -678,19 +679,19 @@ public class ChatStreamService {
             builder.append("【长期标签记忆】\n");
             builder.append(longTermTags).append('\n');
         }
-        if (longTermBehavior != null && !longTermBehavior.isBlank()) {
-            builder.append("【长期行为记忆】\n");
-            builder.append(longTermBehavior).append('\n');
-        }
-        if (semanticMemories != null && !semanticMemories.isEmpty()) {
-            builder.append("【长期语义记忆】\n");
-            for (String memory : semanticMemories) {
-                if (memory == null || memory.isBlank()) {
-                    continue;
-                }
-                builder.append("- ").append(memory.strip()).append('\n');
-            }
-        }
+//        if (longTermBehavior != null && !longTermBehavior.isBlank()) {
+//            builder.append("【长期行为记忆】\n");
+//            builder.append(longTermBehavior).append('\n');
+//        }
+//        if (semanticMemories != null && !semanticMemories.isEmpty()) {
+//            builder.append("【长期语义记忆】\n");
+//            for (String memory : semanticMemories) {
+//                if (memory == null || memory.isBlank()) {
+//                    continue;
+//                }
+//                builder.append("- ").append(memory.strip()).append('\n');
+//            }
+//        }
         builder.append("【用户当前输入】\n").append(currentInput == null ? "" : currentInput);
         return builder.toString();
     }
